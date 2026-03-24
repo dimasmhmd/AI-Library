@@ -16,41 +16,46 @@ from langchain_community.vectorstores import Chroma
 # ==========================================
 # 1. KONFIGURASI & PENYIMPANAN
 # ==========================================
-st.set_page_config(page_title="Pro Corporate Library", page_icon="🏢", layout="wide")
+st.set_page_config(page_title="Secure Corporate Library", page_icon="🛡️", layout="wide")
 
 ADMIN_PASSWORD = "admin123" 
 DB_DIR = "permanent_library_db"
-PDF_STORAGE_DIR = "stored_pdfs" # Folder untuk file PDF asli
+PDF_STORAGE_DIR = "stored_pdfs"
+LOG_FILE = "logs_evaluasi.csv"
 
-# Buat folder jika belum ada
-if not os.path.exists(PDF_STORAGE_DIR):
-    os.makedirs(PDF_STORAGE_DIR)
+for folder in [PDF_STORAGE_DIR, DB_DIR]:
+    if not os.path.exists(folder): os.makedirs(folder)
 
 if "GROQ_API_KEY" in st.secrets:
     os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
 else:
-    st.error("⚠️ GROQ_API_KEY tidak ditemukan di Secrets!")
+    st.error("⚠️ GROQ_API_KEY tidak ditemukan!")
     st.stop()
 
 # ==========================================
 # 2. FUNGSI CORE
 # ==========================================
+def save_log(query, response, pages):
+    """Mencatat aktivitas pertanyaan ke CSV."""
+    df = pd.DataFrame([{
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "User_Query": query,
+        "AI_Response_Snippet": response[:100] + "...",
+        "Source_Pages": str(pages)
+    }])
+    df.to_csv(LOG_FILE, mode='a', header=not os.path.exists(LOG_FILE), index=False)
+
 def get_audio_html(text):
     try:
-        detected_lang = detect(text) if text else 'id'
-        if detected_lang not in ['id', 'en', 'ja', 'ko']: detected_lang = 'id'
-        tts = gTTS(text=text, lang=detected_lang)
+        lang = detect(text) if text else 'id'
+        if lang not in ['id', 'en', 'ja', 'ko']: lang = 'id'
+        tts = gTTS(text=text, lang=lang)
         filename = "temp_voice.mp3"
         tts.save(filename)
         with open(filename, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         if os.path.exists(filename): os.remove(filename)
-        return f"""
-            <div style="background-color: #f0f2f6; padding: 10px; border-radius: 10px; border-left: 5px solid #ff4b4b; margin-top: 10px;">
-                <p style="margin-bottom: 5px; font-weight: bold; color: #31333F;">🔊 Audio Output ({detected_lang.upper()}):</p>
-                <audio controls style="width: 100%;"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>
-            </div>
-            """
+        return f'<audio controls style="width: 100%;"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
     except: return ""
 
 @st.cache_resource
@@ -58,146 +63,105 @@ def load_embeddings():
     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 def get_vectorstore():
-    if os.path.exists(DB_DIR):
+    if os.path.exists(DB_DIR) and glob.glob(f"{DB_DIR}/*"):
         return Chroma(persist_directory=DB_DIR, embedding_function=load_embeddings(), collection_name="admin_lib")
     return None
-
-def get_document_list(vectorstore):
-    if vectorstore is None: return []
-    try:
-        data = vectorstore.get()
-        metadatas = data.get('metadatas', [])
-        sources = set([m.get('source', 'Unknown') for m in metadatas])
-        return sorted(list(sources))
-    except: return []
 
 def add_to_library(uploaded_file):
     fname = uploaded_file.name
     save_path = os.path.join(PDF_STORAGE_DIR, fname)
-    
-    # Simpan file asli secara permanen untuk fitur download
     with open(save_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
-    
     loader = PyPDFLoader(save_path)
     pages = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = text_splitter.split_documents(pages)
-    
-    vectorstore = Chroma.from_documents(
-        documents=chunks, embedding=load_embeddings(),
-        persist_directory=DB_DIR, collection_name="admin_lib"
-    )
-    return vectorstore
-
-def delete_specific_doc(vectorstore, source_path):
-    try:
-        # Hapus dari Vector DB
-        vectorstore.delete(where={"source": source_path})
-        # Hapus file asli dari storage
-        if os.path.exists(source_path):
-            os.remove(source_path)
-        return True
-    except Exception as e:
-        st.error(f"Gagal menghapus: {e}")
-        return False
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(pages)
+    return Chroma.from_documents(chunks, load_embeddings(), persist_directory=DB_DIR, collection_name="admin_lib")
 
 # ==========================================
-# 3. SIDEBAR & ADMIN POP OVER
+# 3. SIDEBAR & ADMIN PANEL
 # ==========================================
 if "messages" not in st.session_state: st.session_state.messages = []
-if "current_audio" not in st.session_state: st.session_state.current_audio = None
+if "is_admin" not in st.session_state: st.session_state.is_admin = False
 if "vectorstore" not in st.session_state: st.session_state.vectorstore = get_vectorstore()
 
 with st.sidebar:
     st.title("🏢 Navigation")
     
     with st.popover("🔐 Login Admin", use_container_width=True):
-        input_pass = st.text_input("Admin Password", type="password")
-        is_admin = input_pass == ADMIN_PASSWORD
-        if is_admin: st.success("Authenticated")
-        elif input_pass: st.error("Invalid Password")
+        input_pass = st.text_input("Password", type="password")
+        if st.button("Submit"):
+            if input_pass == ADMIN_PASSWORD:
+                st.session_state.is_admin = True
+                st.rerun()
+            else: st.error("Salah!")
+        
+        if st.session_state.is_admin:
+            if st.button("Logout"):
+                st.session_state.is_admin = False
+                st.rerun()
 
     st.divider()
 
-    if is_admin:
-        st.subheader("🛠️ Library Manager")
+    if st.session_state.is_admin:
+        tab1, tab2 = st.tabs(["📦 Library", "📊 Reports"])
         
-        doc_list = get_document_list(st.session_state.vectorstore)
-        if doc_list:
-            st.caption("Dokumen Tersimpan:")
-            for doc_path in doc_list:
-                doc_name = os.path.basename(doc_path)
-                with st.container(border=True):
-                    st.text(f"📄 {doc_name}")
-                    col1, col2 = st.columns(2)
-                    
-                    # Fitur Download
-                    if os.path.exists(doc_path):
-                        with open(doc_path, "rb") as f:
-                            col1.download_button(
-                                label="📥", 
-                                data=f, 
-                                file_name=doc_name, 
-                                mime="application/pdf",
-                                key=f"dl_{doc_path}"
-                            )
-                    
-                    # Fitur Hapus
-                    if col2.button("🗑️", key=f"del_{doc_path}", use_container_width=True):
-                        if delete_specific_doc(st.session_state.vectorstore, doc_path):
-                            st.toast(f"{doc_name} dihapus!")
-                            st.rerun()
-        else:
-            st.info("Library kosong.")
-
-        st.divider()
-        uploaded_pdf = st.file_uploader("Upload New PDF", type="pdf", label_visibility="collapsed")
-        if st.button("➕ Add to Library", use_container_width=True):
-            if uploaded_pdf:
-                with st.spinner("Indexing..."):
+        with tab1:
+            st.subheader("Manage Files")
+            uploaded_pdf = st.file_uploader("Upload PDF", type="pdf")
+            if st.button("Add PDF"):
+                if uploaded_pdf:
                     st.session_state.vectorstore = add_to_library(uploaded_pdf)
-                    st.success("Done!")
+                    st.success("Added!")
                     st.rerun()
+        
+        with tab2:
+            st.subheader("Activity Logs")
+            if os.path.exists(LOG_FILE):
+                log_df = pd.read_csv(LOG_FILE)
+                st.dataframe(log_df.tail(10), use_container_width=True)
+                st.download_button("Download Full Report", log_df.to_csv(index=False), "report.csv", "text/csv")
+            else:
+                st.info("No logs yet.")
     else:
-        st.info("Mode Pengguna: Tanya jawab dengan dokumen perusahaan.")
-
-    if st.button("🧹 Clear Chat History", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.current_audio = None
-        st.rerun()
+        st.info("User Mode: Ask questions below.")
 
 # ==========================================
-# 4. HALAMAN UTAMA
+# 4. CHAT INTERFACE
 # ==========================================
-st.title("📚 Corporate Knowledge Base")
-
-if st.session_state.vectorstore is None:
-    st.info("👋 Library kosong. Admin dapat mengunggah dokumen via panel login.")
+st.title("🛡️ Secure Knowledge Hub")
 
 for m in st.session_state.messages:
-    with st.chat_message(m["role"]): st.markdown(m["content"])
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+        if "ref" in m and st.session_state.is_admin:
+            with st.expander("🔍 References (Admin Only)"): st.markdown(m["ref"])
 
-if prompt := st.chat_input("Tanyakan sesuatu..."):
+if prompt := st.chat_input("Ask something..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
 
     if st.session_state.vectorstore:
         with st.chat_message("assistant"):
-            with st.spinner("Berpikir..."):
-                results = st.session_state.vectorstore.similarity_search(prompt, k=3)
-                context = "\n".join([d.page_content for d in results])
-                pages = sorted(list(set([d.metadata.get('page', 0) + 1 for d in results])))
-                
-                llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.1)
-                ans = llm.invoke(f"Konteks: {context}\nPertanyaan: {prompt}").content
-                
-                full_res = f"{ans}\n\n> 📍 **Ref:** Hal {', '.join(map(str, pages))}"
-                st.markdown(full_res)
-                st.session_state.current_audio = get_audio_html(ans)
-                st.session_state.messages.append({"role": "assistant", "content": full_res})
-                st.rerun()
-
-if st.session_state.current_audio:
-    st.divider()
-    st.markdown(st.session_state.current_audio, unsafe_allow_html=True)
+            results = st.session_state.vectorstore.similarity_search(prompt, k=3)
+            context = "\n".join([d.page_content for d in results])
+            ans = ChatGroq(model_name="llama-3.1-8b-instant").invoke(f"Context: {context}\nQuestion: {prompt}").content
+            
+            st.markdown(ans)
+            
+            # Log & Admin Ref
+            pages = sorted(list(set([d.metadata.get('page', 0) + 1 for d in results])))
+            save_log(prompt, ans, pages)
+            
+            ref_text = f"**Pages:** {', '.join(map(str, pages))}\n\n"
+            for d in results: ref_text += f"- *Hal {d.metadata.get('page',0)+1}:* {d.page_content[:150]}...\n"
+            
+            if st.session_state.is_admin:
+                with st.expander("🔍 References (Admin Only)"): st.markdown(ref_text)
+            
+            st.session_state.messages.append({"role": "assistant", "content": ans, "ref": ref_text})
+            
+            # Persistent Audio Player
+            audio_html = get_audio_html(ans)
+            if audio_html: st.markdown(audio_html, unsafe_allow_html=True)
+    else:
+        st.info("Library is empty.")
